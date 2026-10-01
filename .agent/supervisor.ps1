@@ -109,22 +109,68 @@ function Get-NonAgentChanges {
     return $filtered
 }
 
+function Has-ExistingTask {
 
-function Assert-CleanSourceTree {
+    if (!(Test-Path $TaskFile)) {
+        return $false
+    }
+
+    $content = Get-Content $TaskFile -Raw
+
+    return ![string]::IsNullOrWhiteSpace($content)
+}
+
+
+function Assert-StartupState {
+
     $changes = @(Get-NonAgentChanges)
 
-    if ($changes.Count -gt 0) {
-        Write-Host ""
-        Write-Host "Source tree contains uncommitted changes:" -ForegroundColor Yellow
-        $changes | ForEach-Object { Write-Host $_ }
-
-        throw @"
-The supervisor will not start with existing source changes.
-
-Commit or stash the current Astra work first.
-.agent files are ignored by this check.
-"@
+    if ($changes.Count -eq 0) {
+        return
     }
+
+    if (Has-ExistingTask) {
+
+        $currentBranch = (git branch --show-current).Trim()
+
+        if ($currentBranch -ne $AgentBranch) {
+            throw @"
+An unfinished task and source changes exist, but the current branch is:
+
+$currentBranch
+
+Expected:
+
+$AgentBranch
+
+Refusing to switch branches with an interrupted task.
+"@
+        }
+
+        Write-Host ""
+        Write-Host "Existing TASK.md and unfinished source changes detected." -ForegroundColor Yellow
+        Write-Host "The supervisor will resume the interrupted task." -ForegroundColor Yellow
+        Write-Host ""
+
+        $changes | ForEach-Object {
+            Write-Host "  $_"
+        }
+
+        return
+    }
+
+    Write-Host ""
+    Write-Host "Source tree contains uncommitted changes but no active TASK.md:" -ForegroundColor Yellow
+
+    $changes | ForEach-Object {
+        Write-Host $_
+    }
+
+    throw @"
+The supervisor cannot determine whether these changes belong to an interrupted task.
+
+Commit, stash, or restore them before starting.
+"@
 }
 
 
@@ -637,6 +683,20 @@ The repository is the source of truth for what is currently implemented.
 
 Implement EXACTLY the task in .agent/TASK.md.
 
+IMPORTANT:
+
+This task may be resumed after an interrupted supervisor run.
+
+Before editing:
+- inspect the current git diff
+- inspect all existing uncommitted changes
+- determine which parts of TASK.md are already implemented
+
+Continue the existing implementation.
+
+Do NOT discard or restart correct unfinished work.
+Do NOT assume the working tree was clean when this invocation began.
+
 Engineering rules:
 
 - Inspect existing architecture before editing.
@@ -1039,7 +1099,7 @@ Assert-CommandExists "codex"
 
 Check-Stop
 
-Assert-CleanSourceTree
+Assert-StartupState
 
 Ensure-AgentBranch
 
@@ -1062,10 +1122,23 @@ while ($true) {
 
 
     # --------------------------------------------------------
-    # 1. Plan
+    # 1. Plan or resume
     # --------------------------------------------------------
 
-    Plan-NextSlice
+    if (Has-ExistingTask) {
+
+        Write-Section "RESUMING EXISTING TASK"
+
+        $existingTask = Get-Content $TaskFile -Raw
+
+        Write-Host "An unfinished task already exists."
+        Write-Host ""
+        Write-Host $existingTask
+    }
+    else {
+
+        Plan-NextSlice
+    }
 
     Check-Stop
 
