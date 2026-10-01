@@ -152,32 +152,23 @@ function Run-Claude {
     param([string]$Prompt)
 
     Write-Section "CLAUDE"
-
     Check-Stop
 
-    $output = @(
-        $Prompt |
-            & claude `
-                -p `
-                --output-format text `
-                --dangerously-skip-permissions `
-                2>&1
-    )
+    $timestamp = Get-Date -Format "yyyyMMdd-HHmmss"
+    $logPath = Join-Path $LogDir "$timestamp-claude.log"
 
-    $exitCode = $LASTEXITCODE
-    $text = $output -join [Environment]::NewLine
+    $Prompt |
+        & claude `
+            -p `
+            --output-format text `
+            --dangerously-skip-permissions `
+            2>&1 |
+        Tee-Object -FilePath $logPath
 
-    Write-Host $text
-
-    Write-Log "claude" $text
-
-    if ($exitCode -ne 0) {
-        throw "Claude failed with exit code $exitCode."
+    if ($LASTEXITCODE -ne 0) {
+        throw "Claude failed with exit code $LASTEXITCODE."
     }
-
-    return $text
 }
-
 
 # ============================================================
 # Codex
@@ -198,29 +189,69 @@ function Run-CodexCapture {
     param([string]$Prompt)
 
     Write-Section "CODEX"
-
     Check-Stop
 
-    $output = @(
-        $Prompt |
-            & codex exec - `
-                2>&1
-    )
+    $codexExe = Join-Path $env:APPDATA "npm\codex.cmd"
 
-    $exitCode = $LASTEXITCODE
-    $text = $output -join [Environment]::NewLine
-
-    Write-Host $text
-
-    Write-Log "codex" $text
-
-    if ($exitCode -ne 0) {
-        throw "Codex failed with exit code $exitCode."
+    if (!(Test-Path $codexExe)) {
+        throw "Codex CLI wrapper not found at $codexExe"
     }
 
-    return $text
-}
+    $id = [Guid]::NewGuid().ToString("N")
 
+    $stdin  = Join-Path $env:TEMP "astra-codex-$id-in.txt"
+    $stdout = Join-Path $env:TEMP "astra-codex-$id-out.txt"
+    $stderr = Join-Path $env:TEMP "astra-codex-$id-err.txt"
+
+    $timestamp = Get-Date -Format "yyyyMMdd-HHmmss"
+    $logPath = Join-Path $LogDir "$timestamp-codex.log"
+
+    try {
+        $Prompt | Set-Content -Path $stdin -Encoding UTF8
+
+        $process = Start-Process `
+            -FilePath $codexExe `
+            -ArgumentList "exec", "-" `
+            -RedirectStandardInput $stdin `
+            -RedirectStandardOutput $stdout `
+            -RedirectStandardError $stderr `
+            -NoNewWindow `
+            -Wait `
+            -PassThru
+
+        $result = Get-Content $stdout -Raw
+
+        $debugText = ""
+        if (Test-Path $stderr) {
+            $debugText = Get-Content $stderr -Raw
+        }
+
+        # Show Codex metadata/debug output
+        if (![string]::IsNullOrWhiteSpace($debugText)) {
+            Write-Host $debugText -ForegroundColor DarkGray
+        }
+
+        # Show actual Codex answer
+        Write-Host $result
+
+        @"
+===== CODEX STDERR =====
+$debugText
+
+===== CODEX STDOUT =====
+$result
+"@ | Set-Content -Path $logPath -Encoding UTF8
+
+        if ($process.ExitCode -ne 0) {
+            throw "Codex failed with exit code $($process.ExitCode)."
+        }
+
+        return $result
+    }
+    finally {
+        Remove-Item $stdin, $stdout, $stderr -ErrorAction SilentlyContinue
+    }
+}
 
 # ============================================================
 # Build / test validation
@@ -383,18 +414,43 @@ or use the authentication command supported by your Claude CLI.
 
     Write-Host "Testing Codex..."
 
-    $codexOutput = @(
-        "Reply with exactly OK. Do not modify any files." |
-            & codex exec - 2>&1
-    )
+    $codexExe = Join-Path $env:APPDATA "npm\codex.cmd"
 
-    $codexExit = $LASTEXITCODE
+    $stdout = Join-Path $env:TEMP "astra-codex-preflight-out.txt"
+    $stderr = Join-Path $env:TEMP "astra-codex-preflight-err.txt"
+    $stdin  = Join-Path $env:TEMP "astra-codex-preflight-in.txt"
 
-    if ($codexExit -ne 0) {
-        $text = $codexOutput -join [Environment]::NewLine
-        Write-Host $text
+    "Reply with exactly OK. Do not modify any files." |
+        Set-Content -Path $stdin -Encoding UTF8
 
-        throw "Codex CLI preflight failed."
+    $process = Start-Process `
+        -FilePath $codexExe `
+        -ArgumentList "exec", "-" `
+        -RedirectStandardInput $stdin `
+        -RedirectStandardOutput $stdout `
+        -RedirectStandardError $stderr `
+        -NoNewWindow `
+        -Wait `
+        -PassThru
+
+    $codexText = Get-Content $stdout -Raw
+
+    if (Test-Path $stderr) {
+        $codexDebug = Get-Content $stderr -Raw
+
+        if (![string]::IsNullOrWhiteSpace($codexDebug)) {
+            Write-Host $codexDebug -ForegroundColor DarkGray
+        }
+    }
+
+    Remove-Item $stdin, $stdout, $stderr -ErrorAction SilentlyContinue
+
+    if ($process.ExitCode -ne 0) {
+        throw "Codex CLI preflight failed with exit code $($process.ExitCode)."
+    }
+
+    if ($codexText -notmatch "OK") {
+        throw "Codex CLI responded unexpectedly: $codexText"
     }
 
     Write-Host "Codex: OK" -ForegroundColor Green
@@ -413,19 +469,54 @@ function Plan-NextSlice {
 
     $relativePlan = $PlanFile.Replace($Repo + "\", "").Replace("\", "/")
 
+    $roadmap = Get-Content $RoadmapFile -Raw
+
+    $gitLog = git log -15 --oneline
+    $gitLogText = $gitLog -join [Environment]::NewLine
+
+    $gitStatus = git status --short
+    $gitStatusText = $gitStatus -join [Environment]::NewLine
+
+    $sourceFiles = @(
+        Get-ChildItem `
+            -Path (Join-Path $Repo "src"), (Join-Path $Repo "tests") `
+            -Recurse `
+            -File `
+            -Include *.cs,*.csproj,*.axaml |
+        ForEach-Object {
+            $_.FullName.Substring($Repo.Length + 1)
+        }
+    )
+
+    $sourceFileText = $sourceFiles -join [Environment]::NewLine
+
     $prompt = @"
 You are the architecture planner for the Astra astrophotography sequencer.
 
-You are working inside the Astra repository.
+You are working with this Astra repository.
 
-Read and inspect:
+LONG-TERM MASTER PLAN:
+$relativePlan
 
-- $relativePlan
-- .agent/ROADMAP.md
-- the current repository
-- recent git history
-- existing tests
-- current architecture
+CURRENT ROADMAP:
+----------------
+$roadmap
+----------------
+
+RECENT COMMITS:
+----------------
+$gitLogText
+----------------
+
+CURRENT GIT STATUS:
+----------------
+$gitStatusText
+----------------
+
+CURRENT SOURCE/TEST FILES:
+----------------
+$sourceFileText
+----------------
 
 IMPORTANT AUTHORITY ORDER:
 
@@ -453,10 +544,10 @@ Astra product principles include:
 
 Before selecting the next task:
 
-1. Inspect the current repo.
-2. Inspect recent commits.
+1. Inspect the current repository using your read-only repository tools if needed.
+2. Use the recent commits and file list above to understand current reality.
 3. Determine what is already implemented.
-4. Compare the real implementation against the long-term plan.
+4. Compare the implementation against the long-term plan.
 5. Identify the smallest meaningful architectural/product gap.
 6. Prefer foundational correctness over flashy features.
 7. Choose exactly ONE coherent implementation slice.
@@ -466,6 +557,8 @@ DO NOT modify any files.
 DO NOT implement anything.
 
 DO NOT commit.
+
+Do NOT depend on shell access being available.
 
 Return ONLY a complete implementation task in Markdown.
 
@@ -643,20 +736,57 @@ function Review-CurrentTask {
 
     $relativePlan = $PlanFile.Replace($Repo + "\", "").Replace("\", "/")
 
+    $task = Get-Content $TaskFile -Raw
+    $roadmap = Get-Content $RoadmapFile -Raw
+
+    $gitDiff = git diff --no-ext-diff
+    $gitDiffText = $gitDiff -join [Environment]::NewLine
+
+    $gitStatus = git status --short
+    $gitStatusText = $gitStatus -join [Environment]::NewLine
+
+    $gitLog = git log -8 --oneline
+    $gitLogText = $gitLog -join [Environment]::NewLine
+
     $prompt = @"
 You are the senior code/architecture reviewer for Astra.
 
 DO NOT modify files.
 
-Read:
+The supervisor has already collected the important repository context for you.
 
-- $relativePlan
-- .agent/ROADMAP.md
-- .agent/TASK.md
-- current git diff
-- relevant existing code
-- relevant tests
-- recent git history
+MASTER PLAN:
+$relativePlan
+
+CURRENT ROADMAP:
+----------------
+$roadmap
+----------------
+
+CURRENT TASK:
+----------------
+$task
+----------------
+
+GIT STATUS:
+----------------
+$gitStatusText
+----------------
+
+CURRENT SOURCE DIFF:
+----------------
+$gitDiffText
+----------------
+
+RECENT COMMITS:
+----------------
+$gitLogText
+----------------
+
+You may inspect repository files using your available read-only tools if needed.
+
+Do NOT depend on shell execution being available.
+The supervisor itself has already run build and tests.
 
 Review the implementation against TASK.md and Astra's existing architecture.
 
@@ -775,45 +905,39 @@ function Get-CommitMessage {
 
     Write-Section "GENERATING COMMIT MESSAGE"
 
-    $prompt = @"
-Read:
+    $task = Get-Content $TaskFile -Raw
 
-- .agent/TASK.md
-- the currently staged git diff
+    # Try to derive a useful conventional commit from the Goal section.
+    if ($task -match '(?is)# Goal\s+(.*?)(?=\r?\n# |\z)') {
 
-Return ONLY one concise Conventional Commit message.
+        $goalSection = $matches[1].Trim()
 
-Use forms such as:
-
-feat: add guiding abstraction
-feat: add coordinated dithering
-fix: correct safe point cancellation
-refactor: separate sequence execution state
-
-No Markdown.
-No quotes.
-No explanation.
-One line only.
-"@
-
-    $raw = Run-CodexCapture $prompt
-
-    $lines = @(
-        $raw -split "`r?`n" |
+        # First meaningful line from Goal.
+        $firstLine = (
+            $goalSection -split "`r?`n" |
             ForEach-Object { $_.Trim() } |
-            Where-Object { ![string]::IsNullOrWhiteSpace($_) }
-    )
+            Where-Object { ![string]::IsNullOrWhiteSpace($_) } |
+            Select-Object -First 1
+        )
 
-    if ($lines.Count -eq 0) {
-        throw "Codex did not produce a commit message."
+        if ($firstLine) {
+
+            # Remove Markdown emphasis.
+            $firstLine = $firstLine.Replace("**", "")
+            $firstLine = $firstLine.TrimEnd(".")
+
+            # Remove leading "Implement".
+            $firstLine = $firstLine -replace '^(?i)Implement\s+', ''
+
+            if ($firstLine.Length -gt 70) {
+                $firstLine = $firstLine.Substring(0, 70).Trim()
+            }
+
+            return "feat: $($firstLine.ToLowerInvariant())"
+        }
     }
 
-    $message = $lines[0]
-    $message = $message.Trim('`')
-    $message = $message.Trim('"')
-    $message = $message.Trim("'")
-
-    return $message
+    return "feat: implement current astra slice"
 }
 
 
