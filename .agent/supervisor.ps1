@@ -72,6 +72,62 @@ function Write-Section {
     Write-Host "============================================================" -ForegroundColor DarkGray
 }
 
+function Get-ReviewDiff {
+
+    # Normal tracked changes
+    $trackedDiff = git diff --no-ext-diff
+    $trackedDiffText = $trackedDiff -join [Environment]::NewLine
+
+    # Untracked source/test files
+    $untrackedFiles = @(
+        git ls-files --others --exclude-standard |
+        Where-Object {
+            $_ -notmatch '^\.agent/' -and
+            (
+                $_ -match '\.cs$' -or
+                $_ -match '\.csproj$' -or
+                $_ -match '\.axaml$'
+            )
+        }
+    )
+
+    $untrackedText = ""
+
+    foreach ($file in $untrackedFiles) {
+
+        $fullPath = Join-Path $Repo $file
+
+        if (Test-Path $fullPath) {
+
+            $content = Get-Content $fullPath -Raw
+
+            $untrackedText += @"
+
+============================================================
+UNTRACKED FILE: $file
+============================================================
+
+$content
+
+"@
+        }
+    }
+
+    return @"
+============================================================
+TRACKED DIFF
+============================================================
+
+$trackedDiffText
+
+============================================================
+UNTRACKED FILES
+============================================================
+
+$untrackedText
+"@
+}
+
 
 function Check-Stop {
     if (Test-Path $StopFile) {
@@ -799,8 +855,7 @@ function Review-CurrentTask {
     $task = Get-Content $TaskFile -Raw
     $roadmap = Get-Content $RoadmapFile -Raw
 
-    $gitDiff = git diff --no-ext-diff
-    $gitDiffText = $gitDiff -join [Environment]::NewLine
+    $gitDiffText = Get-ReviewDiff
 
     $gitStatus = git status --short
     $gitStatusText = $gitStatus -join [Environment]::NewLine
