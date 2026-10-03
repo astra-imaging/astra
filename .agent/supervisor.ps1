@@ -1,362 +1,1335 @@
 param(
-    [string]$Repo = "C:\Users\juli\source\repos\astra"
+    [string]$Repo = "",
+    [string]$AgentBranch = "agent/astra-dev",
+    [bool]$AutoPush = $true,
+    [int]$MaxReviewRounds = 3,
+    [bool]$RunCliSmokeTest = $true
 )
 
 $ErrorActionPreference = "Stop"
 
-Set-Location $Repo
+# ============================================================
+# Resolve paths
+# ============================================================
 
-$AgentDir = Join-Path $Repo ".agent"
+$ScriptPath = $MyInvocation.MyCommand.Path
+$AgentDir = Split-Path -Parent $ScriptPath
+
+if ([string]::IsNullOrWhiteSpace($Repo)) {
+    $Repo = Split-Path -Parent $AgentDir
+}
+
+$Repo = (Resolve-Path $Repo).Path
+$AgentDir = (Resolve-Path $AgentDir).Path
+
 $TaskFile = Join-Path $AgentDir "TASK.md"
 $ReviewFile = Join-Path $AgentDir "REVIEW.md"
 $RoadmapFile = Join-Path $AgentDir "ROADMAP.md"
 $StopFile = Join-Path $AgentDir "STOP"
+$LogDir = Join-Path $AgentDir "logs"
 
-function Write-Section($text) {
-    Write-Host ""
-    Write-Host "============================================================"
-    Write-Host $text
-    Write-Host "============================================================"
+$PlanMarkdown = Join-Path $AgentDir "ASTRA_PROJECT_PLAN.md"
+$PlanPdf = Join-Path $AgentDir "ASTRA_PROJECT_PLAN.pdf"
+
+if (Test-Path $PlanMarkdown) {
+    $PlanFile = $PlanMarkdown
 }
+elseif (Test-Path $PlanPdf) {
+    $PlanFile = $PlanPdf
+}
+else {
+    throw @"
+No Astra project plan found.
+
+Add one of:
+
+.agent\ASTRA_PROJECT_PLAN.md
+.agent\ASTRA_PROJECT_PLAN.pdf
+"@
+}
+
+if (!(Test-Path $RoadmapFile)) {
+    throw "Missing .agent\ROADMAP.md"
+}
+
+if (!(Test-Path $LogDir)) {
+    New-Item -ItemType Directory -Path $LogDir | Out-Null
+}
+
+Set-Location $Repo
+
+
+# ============================================================
+# Helpers
+# ============================================================
+
+function Write-Section {
+    param([string]$Text)
+
+    Write-Host ""
+    Write-Host "============================================================" -ForegroundColor DarkGray
+    Write-Host $Text -ForegroundColor Cyan
+    Write-Host "============================================================" -ForegroundColor DarkGray
+}
+
+function Get-ReviewDiff {
+
+    # Normal tracked changes
+    $trackedDiff = git diff --no-ext-diff
+    $trackedDiffText = $trackedDiff -join [Environment]::NewLine
+
+    # Untracked source/test files
+    $untrackedFiles = @(
+        git ls-files --others --exclude-standard |
+        Where-Object {
+            $_ -notmatch '^\.agent/' -and
+            (
+                $_ -match '\.cs$' -or
+                $_ -match '\.csproj$' -or
+                $_ -match '\.axaml$'
+            )
+        }
+    )
+
+    $untrackedText = ""
+
+    foreach ($file in $untrackedFiles) {
+
+        $fullPath = Join-Path $Repo $file
+
+        if (Test-Path $fullPath) {
+
+            $content = Get-Content $fullPath -Raw
+
+            $untrackedText += @"
+
+============================================================
+UNTRACKED FILE: $file
+============================================================
+
+$content
+
+"@
+        }
+    }
+
+    return @"
+============================================================
+TRACKED DIFF
+============================================================
+
+$trackedDiffText
+
+============================================================
+UNTRACKED FILES
+============================================================
+
+$untrackedText
+"@
+}
+
 
 function Check-Stop {
     if (Test-Path $StopFile) {
-        Write-Host "STOP file detected. Exiting."
+        Write-Section "STOP REQUESTED"
+        Write-Host ".agent\STOP detected. Exiting cleanly."
         exit 0
     }
 }
 
-function Run-Validation {
-    Write-Section "BUILD"
 
-    dotnet build --no-incremental
-    if ($LASTEXITCODE -ne 0) {
+function Assert-CommandExists {
+    param([string]$Command)
+
+    if (!(Get-Command $Command -ErrorAction SilentlyContinue)) {
+        throw "Required command '$Command' was not found in PATH."
+    }
+}
+
+
+function Get-NonAgentChanges {
+    $lines = @(git status --porcelain)
+
+    $filtered = @()
+
+    foreach ($line in $lines) {
+
+        # Ignore all supervisor-control files.
+        if ($line -match '\.agent[/\\]') {
+            continue
+        }
+
+        $filtered += $line
+    }
+
+    return $filtered
+}
+
+function Has-ExistingTask {
+
+    if (!(Test-Path $TaskFile)) {
         return $false
     }
 
-    Write-Section "TEST"
+    $content = Get-Content $TaskFile -Raw
 
-    dotnet test
+    return ![string]::IsNullOrWhiteSpace($content)
+}
+
+
+function Assert-StartupState {
+
+    $changes = @(Get-NonAgentChanges)
+
+    if ($changes.Count -eq 0) {
+        return
+    }
+
+    if (Has-ExistingTask) {
+
+        $currentBranch = (git branch --show-current).Trim()
+
+        if ($currentBranch -ne $AgentBranch) {
+            throw @"
+An unfinished task and source changes exist, but the current branch is:
+
+$currentBranch
+
+Expected:
+
+$AgentBranch
+
+Refusing to switch branches with an interrupted task.
+"@
+        }
+
+        Write-Host ""
+        Write-Host "Existing TASK.md and unfinished source changes detected." -ForegroundColor Yellow
+        Write-Host "The supervisor will resume the interrupted task." -ForegroundColor Yellow
+        Write-Host ""
+
+        $changes | ForEach-Object {
+            Write-Host "  $_"
+        }
+
+        return
+    }
+
+    Write-Host ""
+    Write-Host "Source tree contains uncommitted changes but no active TASK.md:" -ForegroundColor Yellow
+
+    $changes | ForEach-Object {
+        Write-Host $_
+    }
+
+    throw @"
+The supervisor cannot determine whether these changes belong to an interrupted task.
+
+Commit, stash, or restore them before starting.
+"@
+}
+
+
+function Write-Log {
+    param(
+        [string]$Prefix,
+        [string]$Content
+    )
+
+    $timestamp = Get-Date -Format "yyyyMMdd-HHmmss"
+    $path = Join-Path $LogDir "$timestamp-$Prefix.log"
+
+    Set-Content `
+        -Path $path `
+        -Value $Content `
+        -Encoding UTF8
+}
+
+
+# ============================================================
+# Claude
+# ============================================================
+
+function Run-Claude {
+    param([string]$Prompt)
+
+    Write-Section "CLAUDE"
+    Check-Stop
+
+    $timestamp = Get-Date -Format "yyyyMMdd-HHmmss"
+    $logPath = Join-Path $LogDir "$timestamp-claude.log"
+
+    $Prompt |
+        & claude `
+            -p `
+            --output-format text `
+            --dangerously-skip-permissions `
+            2>&1 |
+        Tee-Object -FilePath $logPath
+
     if ($LASTEXITCODE -ne 0) {
+        throw "Claude failed with exit code $LASTEXITCODE."
+    }
+}
+
+# ============================================================
+# Codex
+#
+# Important:
+# Your codex-cli 0.159.3 rejected --full-auto.
+#
+# We therefore use plain:
+#
+#   codex exec -
+#
+# Codex does NOT edit code in this workflow.
+# It plans, reviews and writes commit messages.
+# Claude is the implementation agent.
+# ============================================================
+
+function Run-CodexCapture {
+    param([string]$Prompt)
+
+    Write-Section "CODEX"
+    Check-Stop
+
+    $codexExe = Join-Path $env:APPDATA "npm\codex.cmd"
+
+    if (!(Test-Path $codexExe)) {
+        throw "Codex CLI wrapper not found at $codexExe"
+    }
+
+    $id = [Guid]::NewGuid().ToString("N")
+
+    $stdin  = Join-Path $env:TEMP "astra-codex-$id-in.txt"
+    $stdout = Join-Path $env:TEMP "astra-codex-$id-out.txt"
+    $stderr = Join-Path $env:TEMP "astra-codex-$id-err.txt"
+
+    $timestamp = Get-Date -Format "yyyyMMdd-HHmmss"
+    $logPath = Join-Path $LogDir "$timestamp-codex.log"
+
+    try {
+        $Prompt | Set-Content -Path $stdin -Encoding UTF8
+
+        $process = Start-Process `
+            -FilePath $codexExe `
+            -ArgumentList "exec", "-" `
+            -RedirectStandardInput $stdin `
+            -RedirectStandardOutput $stdout `
+            -RedirectStandardError $stderr `
+            -NoNewWindow `
+            -Wait `
+            -PassThru
+
+        $result = Get-Content $stdout -Raw
+
+        $debugText = ""
+        if (Test-Path $stderr) {
+            $debugText = Get-Content $stderr -Raw
+        }
+
+        # Show Codex metadata/debug output
+        if (![string]::IsNullOrWhiteSpace($debugText)) {
+            Write-Host $debugText -ForegroundColor DarkGray
+        }
+
+        # Show actual Codex answer
+        Write-Host $result
+
+        @"
+===== CODEX STDERR =====
+$debugText
+
+===== CODEX STDOUT =====
+$result
+"@ | Set-Content -Path $logPath -Encoding UTF8
+
+        if ($process.ExitCode -ne 0) {
+            throw "Codex failed with exit code $($process.ExitCode)."
+        }
+
+        return $result
+    }
+    finally {
+        Remove-Item $stdin, $stdout, $stderr -ErrorAction SilentlyContinue
+    }
+}
+
+# ============================================================
+# Build / test validation
+# ============================================================
+
+function Run-Build {
+    Write-Section "DOTNET BUILD"
+
+    $output = @(
+        & dotnet build --no-incremental 2>&1
+    )
+
+    $exitCode = $LASTEXITCODE
+    $text = $output -join [Environment]::NewLine
+
+    Write-Host $text
+    Write-Log "build" $text
+
+    if ($exitCode -ne 0) {
+        return $false
+    }
+
+    # Reject common compiler/analyzer/MSBuild/NuGet warnings.
+    if ($text -match '(?im)\bwarning\s+(CS|CA|NU|NETSDK|MSB)\d+') {
+        Write-Host "Build contains warnings." -ForegroundColor Red
+        return $false
+    }
+
+    # Also catch final MSBuild warning count if present.
+    if ($text -match '(?im)\b[1-9][0-9]*\s+Warning\(s\)') {
+        Write-Host "Build contains warnings." -ForegroundColor Red
         return $false
     }
 
     return $true
 }
 
-function Run-Claude($prompt) {
-    Write-Section "CLAUDE"
 
-    $prompt | claude -p --output-format text --dangerously-skip-permissions
+function Run-Tests {
+    Write-Section "DOTNET TEST"
+
+    $output = @(
+        & dotnet test 2>&1
+    )
+
+    $exitCode = $LASTEXITCODE
+    $text = $output -join [Environment]::NewLine
+
+    Write-Host $text
+    Write-Log "test" $text
+
+    if ($exitCode -ne 0) {
+        return $false
+    }
+
+    return $true
+}
+
+
+function Run-Validation {
+
+    Check-Stop
+
+    if (!(Run-Build)) {
+        return $false
+    }
+
+    Check-Stop
+
+    if (!(Run-Tests)) {
+        return $false
+    }
+
+    return $true
+}
+
+
+# ============================================================
+# Git branch
+# ============================================================
+
+function Ensure-AgentBranch {
+
+    Write-Section "GIT BRANCH"
+
+    $current = (git branch --show-current).Trim()
 
     if ($LASTEXITCODE -ne 0) {
-        throw "Claude failed with exit code $LASTEXITCODE"
+        throw "Unable to determine current Git branch."
+    }
+
+    if ($current -eq $AgentBranch) {
+        Write-Host "Already on $AgentBranch"
+        return
+    }
+
+    git show-ref --verify --quiet "refs/heads/$AgentBranch"
+
+    if ($LASTEXITCODE -eq 0) {
+
+        Write-Host "Switching to existing branch $AgentBranch"
+
+        git switch $AgentBranch
+
+        if ($LASTEXITCODE -ne 0) {
+            throw "Unable to switch to $AgentBranch"
+        }
+    }
+    else {
+
+        Write-Host "Creating branch $AgentBranch"
+
+        git switch -c $AgentBranch
+
+        if ($LASTEXITCODE -ne 0) {
+            throw "Unable to create $AgentBranch"
+        }
     }
 }
 
-function Run-Codex($prompt) {
-    Write-Section "CODEX"
 
-    $prompt | codex exec -
+# ============================================================
+# CLI smoke tests
+# ============================================================
 
-    if ($LASTEXITCODE -ne 0) {
-        throw "Codex failed with exit code $LASTEXITCODE"
-    }
-}
+function Test-AgentClis {
 
-Write-Section "ASTRA AUTONOMOUS SUPERVISOR"
-
-while ($true) {
-
-    Check-Stop
-
-    # ---------------------------------------------------------
-    # 1. CODEX PLANS NEXT TASK
-    # ---------------------------------------------------------
-
-    Write-Section "PLANNING NEXT SLICE"
-
-    $plannerPrompt = @"
-You are the architecture planner for the Astra astrophotography sequencer.
-
-Read:
-- .agent/ROADMAP.md
-- the current repository
-- git log
-- existing architecture and tests
-
-Choose exactly ONE next coherent implementation slice.
-
-Rules:
-- do not broaden scope
-- do not implement multiple roadmap phases
-- prioritize correctness and architecture
-- respect the Do Not Implement Yet section
-- do not modify source code
-
-Write the full implementation task into:
-
-.agent/TASK.md
-
-The task must include:
-- goal
-- current relevant architecture
-- requirements
-- tests
-- explicit non-goals
-- validation:
-  dotnet build --no-incremental
-  dotnet test
-
-Do not implement the task.
-"@
-
-    Run-Codex $plannerPrompt
-
-    Check-Stop
-
-    if (!(Test-Path $TaskFile)) {
-        throw "Planner did not create TASK.md"
+    if (!$RunCliSmokeTest) {
+        return
     }
 
-    # ---------------------------------------------------------
-    # 2. CLAUDE IMPLEMENTS
-    # ---------------------------------------------------------
+    Write-Section "CLI PREFLIGHT"
 
-    Write-Section "IMPLEMENTATION"
+    Write-Host "Testing Claude authentication..."
 
-    $builderPrompt = @"
-You are the primary implementation agent for Astra.
+    $claudeOutput = @(
+        "Reply with exactly OK." |
+            & claude -p --output-format text 2>&1
+    )
 
-Read:
-- .agent/TASK.md
-- .agent/ROADMAP.md
-- the repository architecture and existing tests
+    $claudeExit = $LASTEXITCODE
 
-Implement exactly the requested task.
+    if ($claudeExit -ne 0) {
+        $text = $claudeOutput -join [Environment]::NewLine
+        Write-Host $text
 
-Rules:
-- inspect existing code before editing
-- do not broaden scope
-- do not modify unrelated systems
-- add focused tests
-- require zero build warnings
-- all existing tests must remain green
-- do not write REVIEW.md
-- do not modify ROADMAP.md
-- do not create the next task
-- do not commit yet
+        throw @"
+Claude CLI authentication failed.
 
-When finished, run:
-dotnet build --no-incremental
-dotnet test
+Run Claude manually and authenticate first, for example:
 
-Fix all failures before finishing.
+    claude
+
+or use the authentication command supported by your Claude CLI.
 "@
+    }
 
-    Run-Claude $builderPrompt
+    Write-Host "Claude: OK" -ForegroundColor Green
 
-    Check-Stop
 
-    # ---------------------------------------------------------
-    # 3. HARD VALIDATION
-    # ---------------------------------------------------------
+    Write-Host "Testing Codex..."
 
-    if (!(Run-Validation)) {
-        Write-Section "VALIDATION FAILED - CLAUDE FIX ROUND"
+    $codexExe = Join-Path $env:APPDATA "npm\codex.cmd"
 
-        $fixPrompt = @"
-The Astra implementation does not currently pass validation.
+    $stdout = Join-Path $env:TEMP "astra-codex-preflight-out.txt"
+    $stderr = Join-Path $env:TEMP "astra-codex-preflight-err.txt"
+    $stdin  = Join-Path $env:TEMP "astra-codex-preflight-in.txt"
 
-Read:
-- .agent/TASK.md
-- current git diff
+    "Reply with exactly OK. Do not modify any files." |
+        Set-Content -Path $stdin -Encoding UTF8
 
-Run:
-dotnet build --no-incremental
-dotnet test
+    $process = Start-Process `
+        -FilePath $codexExe `
+        -ArgumentList "exec", "-" `
+        -RedirectStandardInput $stdin `
+        -RedirectStandardOutput $stdout `
+        -RedirectStandardError $stderr `
+        -NoNewWindow `
+        -Wait `
+        -PassThru
 
-Fix only the failures caused by the current task.
+    $codexText = Get-Content $stdout -Raw
 
-Do not broaden scope.
-Do not commit.
+    if (Test-Path $stderr) {
+        $codexDebug = Get-Content $stderr -Raw
 
-Finish only when build has zero warnings/errors and all tests pass.
-"@
-
-        Run-Claude $fixPrompt
-
-        if (!(Run-Validation)) {
-            throw "Validation failed again. Stopping supervisor."
+        if (![string]::IsNullOrWhiteSpace($codexDebug)) {
+            Write-Host $codexDebug -ForegroundColor DarkGray
         }
     }
 
+    Remove-Item $stdin, $stdout, $stderr -ErrorAction SilentlyContinue
+
+    if ($process.ExitCode -ne 0) {
+        throw "Codex CLI preflight failed with exit code $($process.ExitCode)."
+    }
+
+    if ($codexText -notmatch "OK") {
+        throw "Codex CLI responded unexpectedly: $codexText"
+    }
+
+    Write-Host "Codex: OK" -ForegroundColor Green
+}
+
+
+# ============================================================
+# Planner
+# ============================================================
+
+function Plan-NextSlice {
+
+    Write-Section "PLANNING NEXT ASTRA SLICE"
+
     Check-Stop
 
-    # ---------------------------------------------------------
-    # 4. CODEX REVIEW
-    # ---------------------------------------------------------
+    $relativePlan = $PlanFile.Replace($Repo + "\", "").Replace("\", "/")
 
-    Write-Section "CODE REVIEW"
+    $roadmap = Get-Content $RoadmapFile -Raw
 
-    Remove-Item $ReviewFile -ErrorAction SilentlyContinue
+    $gitLog = git log -15 --oneline
+    $gitLogText = $gitLog -join [Environment]::NewLine
 
-    $reviewPrompt = @"
-You are the senior reviewer for the Astra project.
+    $gitStatus = git status --short
+    $gitStatusText = $gitStatus -join [Environment]::NewLine
 
-Read:
-- .agent/TASK.md
-- .agent/ROADMAP.md
-- git diff
-- all code changed for this task
-- relevant existing architecture
+    $sourceFiles = @(
+        Get-ChildItem `
+            -Path (Join-Path $Repo "src"), (Join-Path $Repo "tests") `
+            -Recurse `
+            -File `
+            -Include *.cs,*.csproj,*.axaml |
+        ForEach-Object {
+            $_.FullName.Substring($Repo.Length + 1)
+        }
+    )
 
-Review for:
-- correctness
-- architecture
-- concurrency
-- cancellation
-- resource lifetime
-- state/event semantics
-- test quality
-- regressions
-- unnecessary complexity
-- scope creep
+    $sourceFileText = $sourceFiles -join [Environment]::NewLine
 
-Run:
+    $prompt = @"
+You are the architecture planner for the Astra astrophotography sequencer.
+
+You are working with this Astra repository.
+
+LONG-TERM MASTER PLAN:
+$relativePlan
+
+CURRENT ROADMAP:
+----------------
+$roadmap
+----------------
+
+RECENT COMMITS:
+----------------
+$gitLogText
+----------------
+
+CURRENT GIT STATUS:
+----------------
+$gitStatusText
+----------------
+
+CURRENT SOURCE/TEST FILES:
+----------------
+$sourceFileText
+----------------
+
+IMPORTANT AUTHORITY ORDER:
+
+1. Current repository state is the source of truth for what already exists.
+2. .agent/ROADMAP.md describes current implementation priorities.
+3. $relativePlan is the long-term product and architecture reference.
+
+The master project plan is NOT a literal unchecked todo list.
+
+Many capabilities from the original plan may already have been implemented
+earlier than the original phase ordering.
+
+Never reimplement functionality that already exists.
+
+Astra product principles include:
+
+- Auto-first, but never auto-only.
+- Automate what can be measured.
+- Automation must not remove control.
+- Expose confidence, not fake certainty.
+- Multi-camera / multi-rig are first-class concepts.
+- The sequencer owns the imaging session.
+- Runtime architecture should remain suitable for future headless operation.
+- Current implementation scope is Windows standalone first.
+
+Before selecting the next task:
+
+1. Inspect the current repository using your read-only repository tools if needed.
+2. Use the recent commits and file list above to understand current reality.
+3. Determine what is already implemented.
+4. Compare the implementation against the long-term plan.
+5. Identify the smallest meaningful architectural/product gap.
+6. Prefer foundational correctness over flashy features.
+7. Choose exactly ONE coherent implementation slice.
+
+DO NOT modify any files.
+
+DO NOT implement anything.
+
+DO NOT commit.
+
+Do NOT depend on shell access being available.
+
+Return ONLY a complete implementation task in Markdown.
+
+The task must include:
+
+# Goal
+
+# Current relevant architecture
+
+# Requirements
+
+# Tests
+
+# Explicit non-goals
+
+# Validation
+
+Validation must require:
+
 dotnet build --no-incremental
 dotnet test
 
-Do NOT implement a new feature.
+with:
+- zero warnings
+- zero errors
+- all tests passing
 
-Small fixes to the current task are allowed if clearly necessary.
-If you make fixes, rerun build and tests.
+The task should be sufficiently detailed for another coding agent to implement
+without inventing major architecture decisions.
 
-Then write exactly one of these to .agent/REVIEW.md:
+Do not wrap your response in a Markdown code fence.
+"@
+
+    $task = Run-CodexCapture $prompt
+
+    if ([string]::IsNullOrWhiteSpace($task)) {
+        throw "Planner returned an empty task."
+    }
+
+    Set-Content `
+        -Path $TaskFile `
+        -Value $task `
+        -Encoding UTF8
+
+    Write-Section "TASK CREATED"
+    Write-Host $task
+}
+
+
+# ============================================================
+# Builder
+# ============================================================
+
+function Implement-CurrentTask {
+
+    Write-Section "IMPLEMENTING CURRENT TASK"
+
+    Check-Stop
+
+    $relativePlan = $PlanFile.Replace($Repo + "\", "").Replace("\", "/")
+
+    $prompt = @"
+You are the primary implementation engineer for the Astra astrophotography
+sequencer.
+
+Read before making changes:
+
+- $relativePlan
+- .agent/ROADMAP.md
+- .agent/TASK.md
+- current repository code
+- relevant tests
+- recent git history
+
+The repository is the source of truth for what is currently implemented.
+
+Implement EXACTLY the task in .agent/TASK.md.
+
+IMPORTANT:
+
+This task may be resumed after an interrupted supervisor run.
+
+Before editing:
+- inspect the current git diff
+- inspect all existing uncommitted changes
+- determine which parts of TASK.md are already implemented
+
+Continue the existing implementation.
+
+Do NOT discard or restart correct unfinished work.
+Do NOT assume the working tree was clean when this invocation began.
+
+Engineering rules:
+
+- Inspect existing architecture before editing.
+- Preserve established naming and patterns where sensible.
+- Do not broaden scope.
+- Do not implement the next roadmap feature.
+- Do not perform unrelated refactors.
+- Keep Core free from UI/platform-specific dependencies.
+- Preserve runtime correctness under cancellation and concurrency.
+- Respect ResourceManager and SafePointCoordinator semantics where relevant.
+- Keep definition/configuration state separate from runtime execution state.
+- Add focused tests for new behavior.
+- Avoid fragile timing-based concurrency tests where synchronization primitives
+  can be used instead.
+- Keep all existing tests passing.
+- Zero build warnings are allowed.
+
+Do NOT modify:
+
+- .agent/ROADMAP.md
+- the Astra master project plan
+- .agent/REVIEW.md
+
+Do NOT choose the next task.
+
+Do NOT commit.
+
+When implementation is complete run:
+
+dotnet build --no-incremental
+dotnet test
+
+Fix all failures and warnings before finishing.
+
+At the end, report concisely:
+- files changed
+- behavior implemented
+- test results
+- architectural concerns
+
+Do not commit.
+"@
+
+    Run-Claude $prompt | Out-Null
+}
+
+
+# ============================================================
+# Build-failure repair
+# ============================================================
+
+function Repair-ValidationFailure {
+
+    Write-Section "CLAUDE VALIDATION REPAIR"
+
+    $prompt = @"
+The current Astra task does not pass the required validation.
+
+Read:
+
+- .agent/TASK.md
+- current git diff
+- build/test failures
+
+Run:
+
+dotnet build --no-incremental
+dotnet test
+
+Fix ONLY issues related to the current task.
+
+Requirements:
+
+- zero warnings
+- zero errors
+- all tests passing
+- no scope expansion
+- no unrelated refactors
+- no new feature beyond TASK.md
+
+Do not commit.
+"@
+
+    Run-Claude $prompt | Out-Null
+}
+
+
+# ============================================================
+# Review
+# ============================================================
+
+function Review-CurrentTask {
+
+    Write-Section "CODEX REVIEW"
+
+    Check-Stop
+
+    $relativePlan = $PlanFile.Replace($Repo + "\", "").Replace("\", "/")
+
+    $task = Get-Content $TaskFile -Raw
+    $roadmap = Get-Content $RoadmapFile -Raw
+
+    $gitDiffText = Get-ReviewDiff
+
+    $gitStatus = git status --short
+    $gitStatusText = $gitStatus -join [Environment]::NewLine
+
+    $gitLog = git log -8 --oneline
+    $gitLogText = $gitLog -join [Environment]::NewLine
+
+    $prompt = @"
+You are the senior code/architecture reviewer for Astra.
+
+DO NOT modify files.
+
+The supervisor has already collected the important repository context for you.
+
+MASTER PLAN:
+$relativePlan
+
+CURRENT ROADMAP:
+----------------
+$roadmap
+----------------
+
+CURRENT TASK:
+----------------
+$task
+----------------
+
+GIT STATUS:
+----------------
+$gitStatusText
+----------------
+
+CURRENT SOURCE DIFF:
+----------------
+$gitDiffText
+----------------
+
+RECENT COMMITS:
+----------------
+$gitLogText
+----------------
+
+You may inspect repository files using your available read-only tools if needed.
+
+Do NOT depend on shell execution being available.
+The supervisor itself has already run build and tests.
+
+Review the implementation against TASK.md and Astra's existing architecture.
+
+Pay particular attention to:
+
+- correctness
+- concurrency
+- cancellation semantics
+- async behavior
+- ResourceManager lifetime/locking
+- SafePoint coordination where relevant
+- state/event consistency
+- sequence execution semantics
+- thread safety
+- resource leaks
+- event subscription leaks
+- error propagation
+- regression risk
+- unnecessary abstractions
+- scope creep
+- tests that prove behavior rather than implementation details
+
+Also verify that the implementation does not accidentally undermine future:
+
+- multi-camera / multi-rig
+- headless runtime
+- remote device proxies
+- plugin boundaries
+
+Do not demand speculative abstractions merely because they may be useful later.
+
+Prefer the smallest architecture appropriate for the current slice.
+
+Return EXACTLY one of these forms:
+
+STATUS: PASS
+
+Summary:
+<short summary>
+
+or:
+
+STATUS: CHANGES_REQUIRED
+
+Findings:
+1. <specific actionable problem>
+2. <specific actionable problem>
+
+Do not wrap the response in a Markdown code fence.
+
+Do not implement fixes.
+Do not commit.
+"@
+
+    $review = Run-CodexCapture $prompt
+
+    Set-Content `
+        -Path $ReviewFile `
+        -Value $review `
+        -Encoding UTF8
+
+    return $review
+}
+
+
+# ============================================================
+# Review repair
+# ============================================================
+
+function Repair-ReviewFindings {
+
+    Write-Section "CLAUDE REVIEW REPAIR"
+
+    $prompt = @"
+The Astra reviewer requested changes to the current task.
+
+Read:
+
+- .agent/TASK.md
+- .agent/REVIEW.md
+- current git diff
+- relevant existing architecture
+
+Address every valid review finding.
+
+Rules:
+
+- stay within the current TASK.md scope
+- do not add the next feature
+- do not perform unrelated refactors
+- preserve existing public behavior unless correction is required
+- add or adjust tests where necessary
+
+Run:
+
+dotnet build --no-incremental
+dotnet test
+
+Require:
+- zero warnings
+- zero errors
+- all tests green
+
+Do not commit.
+"@
+
+    Run-Claude $prompt | Out-Null
+}
+
+
+# ============================================================
+# Commit message
+# ============================================================
+
+function Get-CommitMessage {
+
+    Write-Section "GENERATING COMMIT MESSAGE"
+
+    $task = Get-Content $TaskFile -Raw
+
+    # Try to derive a useful conventional commit from the Goal section.
+    if ($task -match '(?is)# Goal\s+(.*?)(?=\r?\n# |\z)') {
+
+        $goalSection = $matches[1].Trim()
+
+        # First meaningful line from Goal.
+        $firstLine = (
+            $goalSection -split "`r?`n" |
+            ForEach-Object { $_.Trim() } |
+            Where-Object { ![string]::IsNullOrWhiteSpace($_) } |
+            Select-Object -First 1
+        )
+
+        if ($firstLine) {
+
+            # Remove Markdown emphasis.
+            $firstLine = $firstLine.Replace("**", "")
+            $firstLine = $firstLine.TrimEnd(".")
+
+            # Remove leading "Implement".
+            $firstLine = $firstLine -replace '^(?i)Implement\s+', ''
+
+            if ($firstLine.Length -gt 70) {
+                $firstLine = $firstLine.Substring(0, 70).Trim()
+            }
+
+            return "feat: $($firstLine.ToLowerInvariant())"
+        }
+    }
+
+    return "feat: implement current astra slice"
+}
+
+
+# ============================================================
+# Commit
+# ============================================================
+
+function Commit-CurrentSlice {
+
+    Write-Section "COMMITTING SLICE"
+
+    # Stage everything first.
+    git add -A
+
+    if ($LASTEXITCODE -ne 0) {
+        throw "git add failed."
+    }
+
+    # Never auto-commit supervisor control files.
+    git reset -- .agent 2>$null
+
+    $staged = @(git diff --cached --name-only)
+
+    if ($staged.Count -eq 0) {
+        throw "Task produced no staged source changes."
+    }
+
+    Write-Host ""
+    Write-Host "Staged files:"
+    $staged | ForEach-Object { Write-Host "  $_" }
+
+    $message = Get-CommitMessage
+
+    Write-Host ""
+    Write-Host "Commit message: $message" -ForegroundColor Green
+
+    git commit -m $message
+
+    if ($LASTEXITCODE -ne 0) {
+        throw "Git commit failed."
+    }
+
+    Write-Host ""
+    git log -1 --oneline
+}
+
+
+# ============================================================
+# Push
+# ============================================================
+
+function Push-AgentBranch {
+
+    if (!$AutoPush) {
+        return
+    }
+
+    Write-Section "PUSHING"
+
+    $branch = (git branch --show-current).Trim()
+
+    git push -u origin $branch
+
+    if ($LASTEXITCODE -ne 0) {
+        throw "Git push failed."
+    }
+}
+
+
+# ============================================================
+# Cycle cleanup
+# ============================================================
+
+function Clear-CycleFiles {
+
+    Remove-Item $TaskFile -ErrorAction SilentlyContinue
+    Remove-Item $ReviewFile -ErrorAction SilentlyContinue
+}
+
+
+# ============================================================
+# Startup
+# ============================================================
+
+Write-Section "ASTRA AUTONOMOUS SUPERVISOR"
+
+Write-Host "Repository : $Repo"
+Write-Host "Agent dir  : $AgentDir"
+Write-Host "Plan       : $PlanFile"
+Write-Host "Roadmap    : $RoadmapFile"
+Write-Host "Branch     : $AgentBranch"
+Write-Host "Auto push  : $AutoPush"
+Write-Host ""
+
+Assert-CommandExists "git"
+Assert-CommandExists "dotnet"
+Assert-CommandExists "claude"
+Assert-CommandExists "codex"
+
+Check-Stop
+
+Assert-StartupState
+
+Ensure-AgentBranch
+
+Test-AgentClis
+
+
+# ============================================================
+# Main autonomous loop
+# ============================================================
+
+$cycle = 0
+
+while ($true) {
+
+    $cycle++
+
+    Write-Section "ASTRA AGENT CYCLE $cycle"
+
+    Check-Stop
+
+
+    # --------------------------------------------------------
+    # 1. Plan or resume
+    # --------------------------------------------------------
+
+    if (Has-ExistingTask) {
+
+        Write-Section "RESUMING EXISTING TASK"
+
+        $existingTask = Get-Content $TaskFile -Raw
+
+        Write-Host "An unfinished task already exists."
+        Write-Host ""
+        Write-Host $existingTask
+    }
+    else {
+
+        Plan-NextSlice
+    }
+
+    Check-Stop
+
+
+    # --------------------------------------------------------
+    # 2. Implement
+    # --------------------------------------------------------
+
+    Implement-CurrentTask
+
+    Check-Stop
+
+
+    # --------------------------------------------------------
+    # 3. Hard local validation
+    # --------------------------------------------------------
+
+    if (!(Run-Validation)) {
+
+        Repair-ValidationFailure
+
+        Check-Stop
+
+        if (!(Run-Validation)) {
+            throw @"
+Validation still fails after Claude repair.
+
+Stopping for human inspection.
+"@
+        }
+    }
+
+
+    # --------------------------------------------------------
+    # 4. Review / repair loop
+    # --------------------------------------------------------
+
+    $passedReview = $false
+
+    for ($reviewRound = 1; $reviewRound -le $MaxReviewRounds; $reviewRound++) {
+
+        Write-Section "REVIEW ROUND $reviewRound / $MaxReviewRounds"
+
+        Remove-Item $ReviewFile -ErrorAction SilentlyContinue
+
+        $review = Review-CurrentTask
+
+        Check-Stop
+
+        if ($review -match '(?im)^\s*STATUS:\s*PASS\s*$') {
+
+            Write-Host ""
+            Write-Host "Review passed." -ForegroundColor Green
+
+            $passedReview = $true
+            break
+        }
+
+        if ($review -match '(?im)^\s*STATUS:\s*CHANGES_REQUIRED\s*$') {
+
+            Write-Host ""
+            Write-Host "Changes required." -ForegroundColor Yellow
+
+            Repair-ReviewFindings
+
+            Check-Stop
+
+            if (!(Run-Validation)) {
+
+                Repair-ValidationFailure
+
+                if (!(Run-Validation)) {
+                    throw "Validation failed after review repair."
+                }
+            }
+
+            continue
+        }
+
+        throw @"
+Codex review did not contain a valid status.
+
+Expected:
 
 STATUS: PASS
 
 or:
 
 STATUS: CHANGES_REQUIRED
-
-followed by concise actionable findings.
-
-Do not commit.
 "@
-
-    Run-Codex $reviewPrompt
-
-    Check-Stop
-
-    if (!(Test-Path $ReviewFile)) {
-        throw "Codex did not create REVIEW.md"
     }
 
-    $review = Get-Content $ReviewFile -Raw
 
-    # ---------------------------------------------------------
-    # 5. FIX REVIEW FINDINGS
-    # ---------------------------------------------------------
+    if (!$passedReview) {
+        throw @"
+Review still has unresolved findings after $MaxReviewRounds rounds.
 
-    if ($review -match "STATUS:\s*CHANGES_REQUIRED") {
-
-        Write-Section "REVIEW CHANGES REQUIRED"
-
-        $reviewFixPrompt = @"
-The reviewer requested changes.
-
-Read:
-- .agent/TASK.md
-- .agent/REVIEW.md
-- current git diff
-
-Address every valid review finding.
-
-Do not broaden scope.
-Do not add unrelated features.
-Do not commit.
-
-Run:
-dotnet build --no-incremental
-dotnet test
-
-Finish only when validation is green.
+Stopping for human inspection.
 "@
-
-        Run-Claude $reviewFixPrompt
-
-        if (!(Run-Validation)) {
-            throw "Post-review validation failed."
-        }
-
-        # Review once again.
-        Remove-Item $ReviewFile -ErrorAction SilentlyContinue
-        Run-Codex $reviewPrompt
-
-        $review = Get-Content $ReviewFile -Raw
-
-        if ($review -notmatch "STATUS:\s*PASS") {
-            throw "Second review did not pass. Stopping for human inspection."
-        }
     }
 
-    Check-Stop
 
-    # ---------------------------------------------------------
-    # 6. FINAL VALIDATION + COMMIT
-    # ---------------------------------------------------------
+    # --------------------------------------------------------
+    # 5. Final validation
+    # --------------------------------------------------------
+
+    Write-Section "FINAL VALIDATION"
 
     if (!(Run-Validation)) {
         throw "Final validation failed."
     }
 
-    Write-Section "COMMIT"
 
-    git add src tests *.slnx
+    # --------------------------------------------------------
+    # 6. Commit
+    # --------------------------------------------------------
 
-    # Don't commit supervisor control/output files.
-    git reset -- .agent/TASK.md .agent/REVIEW.md 2>$null
+    Commit-CurrentSlice
 
-    $status = git status --porcelain
 
-    if ([string]::IsNullOrWhiteSpace($status)) {
-        Write-Host "No source changes to commit."
-    }
-    else {
-        $commitPrompt = @"
-Read .agent/TASK.md and the current staged git diff.
+    # --------------------------------------------------------
+    # 7. Push
+    # --------------------------------------------------------
 
-Return ONLY one concise Conventional Commit message.
+    Push-AgentBranch
 
-Examples:
-feat: add safe point coordination
-feat: add simulated guiding
-fix: correct resource cancellation behavior
 
-No explanation.
-"@
+    # --------------------------------------------------------
+    # 8. Cleanup
+    # --------------------------------------------------------
 
-        $commitMessage = (
-            $commitPrompt | codex exec -
-        ).Trim()
+    Clear-CycleFiles
 
-        git commit -m $commitMessage
 
-        if ($LASTEXITCODE -ne 0) {
-            throw "Git commit failed."
-        }
+    Write-Section "CYCLE $cycle COMPLETE"
 
-        Write-Host "Committed:"
-        git log -1 --oneline
-    }
-
-    # ---------------------------------------------------------
-    # 7. CLEAN TASK STATE
-    # ---------------------------------------------------------
-
-    Remove-Item $TaskFile -ErrorAction SilentlyContinue
-    Remove-Item $ReviewFile -ErrorAction SilentlyContinue
-
-    Write-Section "SLICE COMPLETE - STARTING NEXT"
+    Write-Host "Sleeping for 2 seconds before planning next slice..."
+    Start-Sleep -Seconds 2
 }
